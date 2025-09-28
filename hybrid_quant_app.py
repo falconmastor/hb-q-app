@@ -42,7 +42,7 @@ import json
 import textwrap
 import datetime as dt
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -54,10 +54,16 @@ try:
 except Exception:
     yf = None
 
+try:
+    from pandas_datareader import data as pdr
+except Exception:
+    pdr = None
+
 # -----------------------------
 # Config & Constants
 # -----------------------------
 FAILED_TICKERS = []  # populated when downloads fail so we can warn the user
+PROVIDER_USED: Dict[str, str] = {}  # ticker -> data source name
 DEFAULT_UNIVERSE = [
     # Liquid US large caps for demo; replace with your universe or load a file
     "AAPL","MSFT","NVDA","AMZN","META","GOOGL","BRK-B","TSLA","LLY","AVGO",
@@ -65,7 +71,7 @@ DEFAULT_UNIVERSE = [
     "NFLX","KO","PEP","PFE","WMT","DIS","CSCO","ADBE","CRM","ABT",
 ]
 
-INDEX_TICKER = "SPY"  # used for beta/hedge; adjust per region
+INDEX_TICKER = "SPY"  # default benchmark used for beta/hedge; can change in sidebar
 TZ = "America/New_York"
 
 # Vol targeting & sizing
@@ -98,6 +104,7 @@ class Signal:
     rationale: str
     valid_from: pd.Timestamp
     valid_to: pd.Timestamp
+    source: str = ""  # which provider supplied data
 
 
 def fmt_pct(x):
@@ -136,12 +143,143 @@ def kelly_fraction(mean_ret: float, vol: float) -> float:
 
 
 # -----------------------------
-# Data Fetchers (Tiingo, FMP, yfinance fallback)
+# Data Fetchers (Polygon, Tiingo, FMP, Finnhub, TwelveData, yfinance, Stooq)
 # -----------------------------
+
+def fetch_polygon(ticker: str, start: str, end: Optional[str] = None) -> Optional[pd.DataFrame]:
+    """Fetch daily OHLCV from Polygon Aggregates API.
+    Requires env var POLYGON_API_KEY. Returns Yahoo-style OHLCV+Adj Close.
+    """
+    key = os.getenv("POLYGON_API_KEY")
+    if not key:
+        return None
+    try:
+        end = end or dt.date.today().isoformat()
+        url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
+        r = requests.get(url, params={"apiKey": key, "adjusted": "true"}, timeout=20)
+        r.raise_for_status()
+        payload = r.json()
+        results = payload.get("results")
+        if not results:
+            return None
+        df = pd.DataFrame(results)
+        df["t"] = pd.to_datetime(df["t"], unit="ms").dt.tz_localize(None)
+        df = df.rename(columns={"t":"Date","o":"Open","h":"High","l":"Low","c":"Close","v":"Volume"})
+        df = df.set_index("Date").sort_index()
+        df["Adj Close"] = df["Close"]
+        needed = ["Open","High","Low","Close","Adj Close","Volume"]
+        for n in needed:
+            if n not in df.columns:
+                df[n] = np.nan
+        return df[needed]
+    except Exception:
+        return None
+
+def fetch_fmp(ticker: str, start: str, end: Optional[str] = None) -> Optional[pd.DataFrame]:
+    key = os.getenv("FMP_API_KEY")
+    if not key:
+        return None
+    try:
+        end = end or dt.date.today().isoformat()
+        url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}"
+        params = {"from": start, "to": end, "apikey": key}
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        js = r.json()
+        hist = js.get("historical") if isinstance(js, dict) else None
+        if not hist:
+            return None
+        df = pd.DataFrame(hist)
+        df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+        df = df.rename(columns={"date":"Date","adjClose":"Adj Close"}).set_index("Date").sort_index()
+        needed = ["open","high","low","close","Adj Close","volume"]
+        for n in needed:
+            if n not in df.columns:
+                df[n] = np.nan
+        df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
+        return df[["Open","High","Low","Close","Adj Close","Volume"]]
+    except Exception:
+        return None
+
+
+def fetch_finnhub(ticker: str, start: str, end: Optional[str] = None) -> Optional[pd.DataFrame]:
+    key = os.getenv("FINNHUB_API_KEY")
+    if not key:
+        return None
+    try:
+        # Finnhub needs unix timestamps
+        start_ts = int(pd.Timestamp(start).timestamp())
+        end_ts = int(pd.Timestamp(end or dt.date.today().isoformat()).timestamp())
+        url = "https://finnhub.io/api/v1/stock/candle"
+        params = {"symbol": ticker, "resolution": "D", "from": start_ts, "to": end_ts, "token": key}
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        js = r.json()
+        if js.get("s") != "ok":
+            return None
+        df = pd.DataFrame({
+            "Date": pd.to_datetime(js["t"], unit="s").tz_localize(None),
+            "Open": js["o"], "High": js["h"], "Low": js["l"], "Close": js["c"], "Volume": js["v"],
+        }).set_index("Date").sort_index()
+        df["Adj Close"] = df["Close"]
+        return df[["Open","High","Low","Close","Adj Close","Volume"]]
+    except Exception:
+        return None
+
+
+def fetch_twelvedata(ticker: str, start: str, end: Optional[str] = None) -> Optional[pd.DataFrame]:
+    key = os.getenv("TWELVEDATA_API_KEY")
+    if not key:
+        return None
+    try:
+        url = "https://api.twelvedata.com/time_series"
+        params = {"symbol": ticker, "interval": "1day", "start_date": start, "end_date": end or dt.date.today().isoformat(), "apikey": key, "outputsize": 5000}
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        js = r.json()
+        values = js.get("values")
+        if not values:
+            return None
+        df = pd.DataFrame(values)
+        # TwelveData returns strings; convert types
+        df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
+        for col in ["open","high","low","close","volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.rename(columns={"datetime":"Date","open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"}).set_index("Date").sort_index()
+        df["Adj Close"] = df["Close"]
+        return df[["Open","High","Low","Close","Adj Close","Volume"]]
+    except Exception:
+        return None
+
 
 def fetch_yf(ticker: str, start: str) -> Optional[pd.DataFrame]:
     if yf is None:
         return None
+    # Robust retry wrapper: yfinance can intermittently fail with JSON decode or tz errors
+    for _ in range(3):
+        try:
+            df = yf.download(ticker, start=start, interval="1d", auto_adjust=False, progress=False, threads=False)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                df.index = pd.to_datetime(df.index).tz_localize(None)
+                return df
+        except Exception:
+            time.sleep(0.8)
+            continue
+        # Second attempt via Ticker().history, which sometimes succeeds when download() fails
+        try:
+            tkr = yf.Ticker(ticker)
+            hist = tkr.history(period="max", interval="1d")
+            if isinstance(hist, pd.DataFrame) and not hist.empty:
+                hist.index = pd.to_datetime(hist.index).tz_localize(None)
+                # Ensure required columns
+                for c in ["Adj Close"]:
+                    if c not in hist.columns and "Close" in hist.columns:
+                        hist[c] = hist["Close"]
+                return hist[[c for c in ["Open","High","Low","Close","Adj Close","Volume"] if c in hist.columns]]
+        except Exception:
+            time.sleep(0.5)
+            continue
+    return None
     # Robust retry wrapper: yfinance can intermittently fail with JSON decode errors
     for _ in range(3):
         try:
@@ -168,7 +306,6 @@ def fetch_tiingo(ticker: str, start: str) -> Optional[pd.DataFrame]:
         if not data:
             return None
         df = pd.DataFrame(data)
-        # normalize columns to Yahoo-style
         df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
         df = df.set_index("date")
         rename = {
@@ -191,14 +328,72 @@ def fetch_tiingo(ticker: str, start: str) -> Optional[pd.DataFrame]:
         return None
 
 
-def get_price_history(ticker: str, start: str) -> Optional[pd.DataFrame]:
-    # Try Tiingo → yfinance with retries
-    df = fetch_tiingo(ticker, start)
-    if df is None:
-        df = fetch_yf(ticker, start)
-    if df is None:
-        FAILED_TICKERS.append(ticker)
-    return df
+def _fetch_stooq(ticker: str) -> Optional[pd.DataFrame]:
+    if pdr is None:
+        return None
+    try:
+        stooq_symbol = ticker
+        if ticker.isalpha() and 1 <= len(ticker) <= 5 and ticker.upper() == ticker:
+            stooq_symbol = f"{ticker}.US"
+        df_s = pdr.DataReader(stooq_symbol, 'stooq')
+        if isinstance(df_s, pd.DataFrame) and not df_s.empty:
+            df_s = df_s.sort_index()
+            needed_cols = ["Open","High","Low","Close","Adj Close","Volume"]
+            for c in needed_cols:
+                if c not in df_s.columns:
+                    if c == "Adj Close" and "Close" in df_s.columns:
+                        df_s[c] = df_s["Close"]
+                    else:
+                        df_s[c] = np.nan
+            return df_s[needed_cols]
+    except Exception:
+        return None
+    return None
+
+
+def get_price_history(ticker: str, start: str, preferred: Optional[str] = None) -> Optional[pd.DataFrame]:
+    """Try providers in order. If preferred is given, try that first."""
+    providers = [
+        ("POLYGON", lambda: fetch_polygon(ticker, start)),
+        ("TIINGO", lambda: fetch_tiingo(ticker, start)),
+        ("FMP",     lambda: fetch_fmp(ticker, start)),
+        ("FINNHUB", lambda: fetch_finnhub(ticker, start)),
+        ("TWELVEDATA", lambda: fetch_twelvedata(ticker, start)),
+        ("YAHOO",   lambda: fetch_yf(ticker, start)),
+        ("STOOQ",   lambda: _fetch_stooq(ticker)),
+    ]
+
+    if preferred:
+        providers.sort(key=lambda p: 0 if p[0] == preferred.upper() else 1)
+
+    for name, fn in providers:
+        df = fn()
+        if df is not None and not df.empty:
+            PROVIDER_USED[ticker] = name
+            return df
+    FAILED_TICKERS.append(ticker)
+    return None
+    """Try providers in order. If preferred is given, try that first."""
+    providers = [
+        ("POLYGON", lambda: fetch_polygon(ticker, start)),
+        ("TIINGO", lambda: fetch_tiingo(ticker, start)),
+        ("FMP",     lambda: fetch_fmp(ticker, start)),
+        ("FINNHUB", lambda: fetch_finnhub(ticker, start)),
+        ("TWELVEDATA", lambda: fetch_twelvedata(ticker, start)),
+        ("YAHOO",   lambda: fetch_yf(ticker, start)),
+        ("STOOQ",   lambda: _fetch_stooq(ticker)),
+    ]
+
+    if preferred:
+        providers.sort(key=lambda p: 0 if p[0] == preferred.upper() else 1)
+
+    for name, fn in providers:
+        df = fn()
+        if df is not None and not df.empty:
+            PROVIDER_USED[ticker] = name
+            return df
+    FAILED_TICKERS.append(ticker)
+    return None
 
 
 # -----------------------------
@@ -263,14 +458,15 @@ def atr_stop_takeprofit(df: pd.DataFrame, risk_reward=RISK_REWARD, atr_mult=STOP
 def build_signals(universe: List[str], start: str, rebalance_weeks: int = 1,
                   end: Optional[str] = None) -> pd.DataFrame:
     rows = []
-    bench_df = get_price_history(INDEX_TICKER, start)
+    bench_symbol = st.session_state.get("benchmark_ticker", INDEX_TICKER)
+    bench_df = get_price_history(bench_symbol, start, preferred=st.session_state.get("preferred_provider"))
     if bench_df is None or bench_df.empty:
         st.warning("Failed to fetch benchmark data; hedges default to 1x SPY.")
     else:
         bench_w = safe_resample_weekly(bench_df["Adj Close"]).pct_change()
 
     for t in universe:
-        df = get_price_history(t, start)
+        df = get_price_history(t, start, preferred=st.session_state.get("preferred_provider"))
         if df is None or df.empty:
             continue
         # weekly series
@@ -326,7 +522,7 @@ def build_signals(universe: List[str], start: str, rebalance_weeks: int = 1,
             rationale.append(f"Mean-rev z: {mr:.2f} (neg z -> oversold)")
         if not np.isnan(ann_vol):
             rationale.append(f"Ann vol: {fmt_pct(ann_vol)}")
-        rationale.append(f"Beta vs {INDEX_TICKER}: {beta:.2f}")
+        rationale.append(f"Beta vs {bench_symbol}: {beta:.2f}")
 
         rows.append(Signal(
             ticker=t,
@@ -341,6 +537,7 @@ def build_signals(universe: List[str], start: str, rebalance_weeks: int = 1,
             rationale="; ".join(rationale),
             valid_from=valid_from,
             valid_to=valid_to,
+            source=PROVIDER_USED.get(t, "")
         ).__dict__)
 
     sigs = pd.DataFrame(rows)
@@ -388,6 +585,13 @@ def main():
 
         rebalance = st.select_slider("Rebalance cadence", options=[1,2], value=1, format_func=lambda w: "Weekly" if w==1 else "Bi-Weekly")
         start_date = st.date_input("Start date for history", dt.date.today() - dt.timedelta(days=800))
+        st.divider()
+        st.caption("Benchmark used for beta/hedge computation")
+        bench = st.text_input("Benchmark ticker", value=INDEX_TICKER)
+        st.session_state["benchmark_ticker"] = bench.strip().upper()
+        st.divider()
+        pref = st.selectbox("Preferred provider", ["Auto","POLYGON","TIINGO","FMP","FINNHUB","TWELVEDATA","YAHOO","STOOQ"], index=0)
+        st.session_state["preferred_provider"] = None if pref=="Auto" else pref
         go = st.button("Run Signals")
 
     if go:
@@ -408,8 +612,13 @@ def main():
             "ticker":"Ticker","action":"Action","entry_price":"Entry Price",
             "stop":"Stop","take_profit":"Take Profit","hedge_ticker":"Hedge",
             "hedge_ratio":"Hedge Ratio","size_pct":"Size %","rationale":"Rationale",
-            "valid_from":"Valid From","valid_to":"Valid To","date":"Signal Date"
+            "valid_from":"Valid From","valid_to":"Valid To","date":"Signal Date",
+            "source":"Source"
         }, inplace=True)
+        # Reflect chosen benchmark in the Hedge column label
+        pretty["Hedge"] = st.session_state.get("benchmark_ticker", INDEX_TICKER)
+        # Reflect chosen benchmark in the Hedge column label
+        pretty["Hedge"] = st.session_state.get("benchmark_ticker", INDEX_TICKER)
         pretty["Size %"] = (pretty["Size %"]*100).round(2)
         pretty["Entry Price"] = pretty["Entry Price"].round(2)
         pretty["Stop"] = pretty["Stop"].round(2)
@@ -417,7 +626,7 @@ def main():
         pretty["Hedge Ratio"] = pretty["Hedge Ratio"].round(2)
         cols = [
             "Ticker","Action","Signal Date","Valid From","Valid To",
-            "Entry Price","Stop","Take Profit","Size %","Hedge","Hedge Ratio","Rationale"
+            "Entry Price","Stop","Take Profit","Size %","Hedge","Hedge Ratio","Source","Rationale"
         ]
         st.subheader("Signals (Actionable)")
         st.dataframe(pretty[cols], use_container_width=True)
@@ -463,6 +672,9 @@ if __name__ == "__main__":
 # numpy==1.26.4
 # requests==2.32.3
 # yfinance==0.2.40
+# pandas-datareader==0.10.0  # Stooq fallback
+# (Polygon, FMP, Finnhub, TwelveData all via plain requests)
+
 
 # ---------------------------------------------------------------------------------
 # Dockerfile (optional)
