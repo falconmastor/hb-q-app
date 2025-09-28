@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------------
+# requirements.txt (create this file alongside the app)
+# ---------------------------------------------------------------------------------
+# streamlit==1.37.0
+# pandas==2.2.2
+# numpy==1.26.4
+# requests==2.32.3
+# yfinance==0.2.40
+
+
+# ---------------------------------------------------------------------------------
+# Dockerfile (optional)
+# ---------------------------------------------------------------------------------
+# FROM python:3.11-slim
+# WORKDIR /app
+# COPY requirements.txt ./
+# RUN pip install --no-cache-dir -r requirements.txt
+# COPY hybrid_quant_app.py ./
+# ENV PORT=8501
+# EXPOSE 8501
+# CMD ["streamlit", "run", "hybrid_quant_app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+
+
+# ---------------------------------------------------------------------------------
+# Notes to extend factors with FMP/Tiingo fundamentals (pseudo-code)
+# ---------------------------------------------------------------------------------
+# - Use FMP endpoints like /ratios or /key-metrics to fetch P/B, ROE, Debt/EBITDA.
+# - Merge into universe and compute Value (cheapness) & Quality (profitability) scores.
+# - Blend into composite: comp = 0.4*mom + 0.3*mr + 0.3*(0.5*value + 0.5*quality)
+# - Rebalance cadence can stay weekly/bi-weekly; fundamentals update slower.
